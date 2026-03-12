@@ -213,4 +213,6 @@ Optional validation evaluation at the end
 
 * Use `py` everywhere (Python launcher on Windows).
 * If you get CUDA/GPU issues, PyTorch will still run on CPU (slower but works).
+* Note: The dataset and trained checkpoints are not included in this repository due to size limitations.
+
 
