@@ -1,0 +1,33 @@
+# Python 3.11 compatible requirements
+# Text-to-Video Retrieval (MSVD)
+
+# -------------------------
+# Deep Learning (Core)
+# -------------------------
+torch>=2.1
+torchvision>=0.16
+
+# -------------------------
+# Transformer (Text Encoder)
+# -------------------------
+transformers>=4.36
+tokenizers>=0.15
+
+# -------------------------
+# Data & Video Processing
+# -------------------------
+numpy>=1.23
+opencv-python>=4.8
+pandas>=2.0
+
+# -------------------------
+# Evaluation & Utilities
+# -------------------------
+scikit-learn>=1.2
+tqdm>=4.66
+
+# -------------------------
+# Optional (recommended)
+# -------------------------
+pyyaml>=6.0
+matplotlib>=3.7

@@ -1,0 +1,48 @@
+# models/video_encoder.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .backbone import CNNBackbone
+
+
+class VideoEncoder(nn.Module):
+    """
+    Input:
+      video_frames: [B, T, 3, H, W]
+    Output:
+      video_emb:    [B, D]
+    Steps:
+      - CNN per frame -> [B*T, feat_dim]
+      - reshape -> [B, T, feat_dim]
+      - temporal aggregation (mean pooling)
+      - projection -> [B, embed_dim]
+      - optional L2 normalization
+    """
+
+    def __init__(self, backbone_name="resnet50", pretrained=True, freeze_backbone=False,
+                 embed_dim=256, dropout=0.1, normalize=True):
+        super().__init__()
+        self.backbone = CNNBackbone(backbone_name=backbone_name, pretrained=pretrained, freeze=freeze_backbone)
+
+        self.proj = nn.Sequential(
+            nn.Linear(self.backbone.feat_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.normalize = normalize
+
+    def forward(self, video_frames: torch.Tensor) -> torch.Tensor:
+        B, T, C, H, W = video_frames.shape
+        x = video_frames.view(B * T, C, H, W)
+        feats = self.backbone(x)  # [B*T, feat_dim]
+        feats = feats.view(B, T, -1)  # [B, T, feat_dim]
+
+        # Temporal aggregation (mean pooling)
+        video_feat = feats.mean(dim=1)  # [B, feat_dim]
+
+        emb = self.proj(video_feat)  # [B, D]
+        if self.normalize:
+            emb = F.normalize(emb, p=2, dim=-1)
+        return emb

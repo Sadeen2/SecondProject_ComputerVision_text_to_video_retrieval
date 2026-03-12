@@ -1,0 +1,94 @@
+# retrieval/search.py
+from __future__ import annotations
+
+import argparse
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+from transformers import AutoTokenizer
+
+from models.config import ModelConfig
+from models.joint_embedding import DualEncoderModel
+from utils.io_utils import load_checkpoint, validate_index_files, load_json, load_numpy, l2_normalize_np
+
+
+def detect_backbone_from_ckpt(ckpt: Dict) -> str:
+    if "cfg" in ckpt and isinstance(ckpt["cfg"], dict):
+        return ckpt["cfg"].get("backbone_name", "resnet18")
+    return ckpt.get("backbone", "resnet18")
+
+
+def detect_text_model_from_ckpt(ckpt: Dict) -> str:
+    if "cfg" in ckpt and isinstance(ckpt["cfg"], dict):
+        return ckpt["cfg"].get("text_model_name", "distilbert-base-uncased")
+    return "distilbert-base-uncased"
+
+
+@torch.no_grad()
+def main():
+    ap = argparse.ArgumentParser(description="Step 5B: Text->Video search using cached index.")
+    ap.add_argument("--checkpoint", type=str, required=True)
+    ap.add_argument("--index_dir", type=str, default="index")
+    ap.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    ap.add_argument("--query", type=str, required=True)
+    ap.add_argument("--top_k", type=int, default=5)
+    ap.add_argument("--max_text_len", type=int, default=32)
+    args = ap.parse_args()
+
+    device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
+
+    # ---- load index ----
+    paths = validate_index_files(args.index_dir)
+    meta = load_json(paths["meta"])
+    video_ids: List[str] = load_json(paths["video_ids"])
+    video_embeds = load_numpy(paths["video_embeds"])  # [N, D]
+    video_embeds = l2_normalize_np(video_embeds)
+
+    # ---- load model ----
+    ckpt = load_checkpoint(args.checkpoint, map_location=str(device))
+    backbone = detect_backbone_from_ckpt(ckpt)
+    text_model = detect_text_model_from_ckpt(ckpt)
+
+    cfg = ModelConfig(
+        backbone_name=backbone,
+        text_model_name=text_model,
+        num_frames=meta.get("num_frames", 4),
+        device=str(device),
+    )
+
+    model = DualEncoderModel(cfg).to(device)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.text_model_name)
+
+    # ---- encode query text ----
+    tokens = tokenizer(
+        [args.query],
+        padding="max_length",
+        truncation=True,
+        max_length=args.max_text_len,
+        return_tensors="pt",
+    )
+    tokens = {k: v.to(device) for k, v in tokens.items()}
+
+    text_emb = model.text_encoder(tokens)  # [1, D]
+    text_emb = torch.nn.functional.normalize(text_emb, dim=1)
+    text_emb = text_emb.detach().cpu().numpy()[0]      # [D]
+
+    # ---- cosine similarity via dot product ----
+    sims = video_embeds @ text_emb  # [N]
+    top_k = min(args.top_k, sims.shape[0])
+    idx = np.argsort(-sims)[:top_k]
+
+    print("\n🔎 Query:", args.query)
+    print(f"Index videos: {len(video_ids)} | Backbone: {cfg.backbone_name} | Text: {cfg.text_model_name}")
+    print("\nTop-K results:")
+    print("----------------------------------------")
+    for rank, i in enumerate(idx, start=1):
+        print(f"{rank:02d}) video_id={video_ids[i]} | score={float(sims[i]):.4f}")
+
+
+if __name__ == "__main__":
+    main()

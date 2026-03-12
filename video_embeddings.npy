@@ -1,0 +1,9 @@
+{
+  "dataset": "MSVD",
+  "split": "val",
+  "backbone": "resnet18",
+  "text_model": "distilbert-base-uncased",
+  "num_frames": 4,
+  "embed_dim": 256,
+  "n_videos": 197
+}

@@ -1,0 +1,222 @@
+# training/validate.py
+import argparse
+from collections import OrderedDict
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+
+from data.video_text_dataset import MSVDDataset, collate_fn
+from models.config import ModelConfig
+from models.joint_embedding import DualEncoderModel
+from utils.metrics import (
+    compute_ranks,
+    recall_at_k,
+    median_rank,
+    mean_rank,
+    mean_average_precision,
+)
+
+
+def _infer_backbone_from_checkpoint(state_dict: dict) -> str:
+    """
+    Best-effort backbone detection from checkpoint weights.
+    Your training code sometimes saves backbone explicitly, sometimes not.
+    """
+    # If you saved cfg dict, use it
+    # train.py saves ckpt["cfg"] = cfg.__dict__
+    # some old ckpts might not have it
+    return None
+
+
+def _get_caption_list(batch: dict):
+    # collate_fn returns "captions"
+    caps = batch.get("captions", None)
+    if caps is None:
+        caps = batch.get("caption", None)
+    if caps is None:
+        raise KeyError(f"Batch keys are {list(batch.keys())}, expected 'captions' or 'caption'")
+    return caps
+
+
+def _get_video_frames(batch: dict):
+    # collate_fn returns "video_frames"
+    vf = batch.get("video_frames", None)
+    if vf is None:
+        vf = batch.get("frames", None)
+    if vf is None:
+        raise KeyError(f"Batch keys are {list(batch.keys())}, expected 'video_frames' or 'frames'")
+    return vf
+
+
+def _get_video_ids(batch: dict):
+    # collate_fn returns "video_ids"
+    vids = batch.get("video_ids", None)
+    if vids is None:
+        vids = batch.get("video_id", None)
+    if vids is None:
+        raise KeyError(f"Batch keys are {list(batch.keys())}, expected 'video_ids' or 'video_id'")
+    return vids
+
+
+@torch.no_grad()
+def main():
+    ap = argparse.ArgumentParser(description="Step 4: MSVD Text-to-Video Retrieval Evaluation (multi-caption).")
+    ap.add_argument("--checkpoint", type=str, required=True)
+    ap.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--num_frames", type=int, default=4)
+    ap.add_argument("--num_workers", type=int, default=2)
+    ap.add_argument("--image_size", type=int, default=224)
+    args = ap.parse_args()
+
+    device = torch.device("cuda" if (args.device == "cuda" and torch.cuda.is_available()) else "cpu")
+    print(f"Using device: {device}")
+
+    # -----------------------
+    # Load checkpoint
+    # -----------------------
+    ckpt = torch.load(args.checkpoint, map_location=device)
+
+    # -----------------------
+    # Build config (must match training!)
+    # -----------------------
+    cfg = ModelConfig()
+    cfg.device = str(device)
+    cfg.num_frames = args.num_frames
+    cfg.image_size = args.image_size
+
+    # Try to recover backbone/text model/embed dim from checkpoint if present
+    # train.py saves ckpt["cfg"] = cfg.__dict__
+    saved_cfg = ckpt.get("cfg", None)
+    if isinstance(saved_cfg, dict):
+        # Only assign keys that exist in ModelConfig
+        for k, v in saved_cfg.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+    # But enforce evaluation-time frames count (must match what dataset loads)
+    cfg.num_frames = args.num_frames
+    cfg.image_size = args.image_size
+
+    # Some older ckpts might not contain backbone in cfg
+    print(f"Backbone: {getattr(cfg, 'backbone_name', 'unknown')} | Text: {getattr(cfg, 'text_model_name', 'unknown')}")
+    print(f"num_frames: {cfg.num_frames} | image_size: {cfg.image_size}")
+
+    # -----------------------
+    # Model + tokenizer
+    # -----------------------
+    model = DualEncoderModel(cfg).to(device)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.text_model_name)
+
+    # -----------------------
+    # Dataset / loader
+    # -----------------------
+    ds = MSVDDataset(
+        annotations_csv="data/processed/annotations.csv",
+        frames_root="data/frames",
+        split=args.split,
+        num_frames=cfg.num_frames,
+        image_size=cfg.image_size,
+    )
+
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,  # IMPORTANT
+        pin_memory=(device.type == "cuda"),
+    )
+
+    # -----------------------
+    # Collect unique videos + all captions
+    # -----------------------
+    # We want:
+    # - one embedding per unique video_id (N_video)
+    # - one embedding per caption/query (N_text)
+    # - gt_video_index for each query
+    video_id_to_index = OrderedDict()  # preserves insertion order
+    video_emb_list = []
+    text_emb_list = []
+    gt_video_index_list = []
+
+    print("Encoding videos & texts...")
+
+    for batch in loader:
+        video_frames = _get_video_frames(batch).to(device)     # [B, T, 3, H, W]
+        captions = _get_caption_list(batch)                    # list[str]
+        video_ids = _get_video_ids(batch)                      # list[str]
+
+        tokens = tokenizer(
+            captions,
+            padding=True,
+            truncation=True,
+            max_length=cfg.max_text_len,
+            return_tensors="pt",
+        )
+        tokens = {k: v.to(device) for k, v in tokens.items()}
+
+        v_emb, t_emb = model(video_frames, tokens)  # [B, D], [B, D]
+
+        v_emb = v_emb.detach().cpu()
+        t_emb = t_emb.detach().cpu()
+
+        # For each item in the batch:
+        for i in range(len(video_ids)):
+            vid = str(video_ids[i])
+
+            # register unique video embedding once
+            if vid not in video_id_to_index:
+                video_id_to_index[vid] = len(video_id_to_index)
+                video_emb_list.append(v_emb[i].unsqueeze(0))
+
+            # text embedding always appended (each caption is a query)
+            text_emb_list.append(t_emb[i].unsqueeze(0))
+
+            # gt index is the unique video index
+            gt_video_index_list.append(video_id_to_index[vid])
+
+    video_emb = torch.cat(video_emb_list, dim=0).numpy()           # (N_video, D)
+    text_emb = torch.cat(text_emb_list, dim=0).numpy()            # (N_text, D)
+    gt_video_index = np.array(gt_video_index_list, dtype=np.int64)  # (N_text,)
+
+    # -----------------------
+    # Similarity (Text->Video)
+    # -----------------------
+    similarity = text_emb @ video_emb.T  # (N_text, N_video)
+
+    # -----------------------
+    # Metrics
+    # -----------------------
+    ranks = compute_ranks(similarity, gt_video_index)
+
+    results = {
+        "R@1": recall_at_k(ranks, 1),
+        "R@5": recall_at_k(ranks, 5),
+        "R@10": recall_at_k(ranks, 10),
+        "MedR": median_rank(ranks),
+        "MeanR": mean_rank(ranks),
+        "mAP": mean_average_precision(similarity, gt_video_index),
+        "N_text": float(text_emb.shape[0]),
+        "N_video": float(video_emb.shape[0]),
+    }
+
+    print("\n📊 Text-to-Video Retrieval Results (MSVD multi-caption)")
+    print("------------------------------------------------------")
+    print(f"N_text queries: {int(results['N_text'])} | N_video unique: {int(results['N_video'])}")
+    for k in ["R@1", "R@5", "R@10", "MedR", "MeanR", "mAP"]:
+        v = results[k]
+        if k in ["MedR", "MeanR"]:
+            print(f"{k:6s}: {v:.2f}")
+        else:
+            print(f"{k:6s}: {v:.4f}")
+
+
+if __name__ == "__main__":
+    main()
